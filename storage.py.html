@@ -1,0 +1,565 @@
+<html>
+<head>
+<title>storage.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #808080;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+storage.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">json</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">posixpath</span>
+<span class="s0">import </span><span class="s1">re</span>
+<span class="s0">from </span><span class="s1">hashlib </span><span class="s0">import </span><span class="s1">md5</span>
+<span class="s0">from </span><span class="s1">urllib.parse </span><span class="s0">import </span><span class="s1">unquote</span><span class="s0">, </span><span class="s1">urldefrag</span><span class="s0">, </span><span class="s1">urlsplit</span><span class="s0">, </span><span class="s1">urlunsplit</span>
+
+<span class="s0">from </span><span class="s1">django.conf </span><span class="s0">import </span><span class="s1">STATICFILES_STORAGE_ALIAS</span><span class="s0">, </span><span class="s1">settings</span>
+<span class="s0">from </span><span class="s1">django.contrib.staticfiles.utils </span><span class="s0">import </span><span class="s1">check_settings</span><span class="s0">, </span><span class="s1">matches_patterns</span>
+<span class="s0">from </span><span class="s1">django.core.exceptions </span><span class="s0">import </span><span class="s1">ImproperlyConfigured</span>
+<span class="s0">from </span><span class="s1">django.core.files.base </span><span class="s0">import </span><span class="s1">ContentFile</span>
+<span class="s0">from </span><span class="s1">django.core.files.storage </span><span class="s0">import </span><span class="s1">FileSystemStorage</span><span class="s0">, </span><span class="s1">storages</span>
+<span class="s0">from </span><span class="s1">django.utils.functional </span><span class="s0">import </span><span class="s1">LazyObject</span>
+
+
+<span class="s0">class </span><span class="s1">StaticFilesStorage(FileSystemStorage):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Standard file system storage for static files. 
+ 
+    The defaults for ``location`` and ``base_url`` are 
+    ``STATIC_ROOT`` and ``STATIC_URL``. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">location=</span><span class="s0">None, </span><span class="s1">base_url=</span><span class="s0">None, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">if </span><span class="s1">location </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">location = settings.STATIC_ROOT</span>
+        <span class="s0">if </span><span class="s1">base_url </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">base_url = settings.STATIC_URL</span>
+        <span class="s1">check_settings(base_url)</span>
+        <span class="s1">super().__init__(location</span><span class="s0">, </span><span class="s1">base_url</span><span class="s0">, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+        <span class="s3"># FileSystemStorage fallbacks to MEDIA_ROOT when location</span>
+        <span class="s3"># is empty, so we restore the empty value.</span>
+        <span class="s0">if not </span><span class="s1">location:</span>
+            <span class="s1">self.base_location = </span><span class="s0">None</span>
+            <span class="s1">self.location = </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">path(self</span><span class="s0">, </span><span class="s1">name):</span>
+        <span class="s0">if not </span><span class="s1">self.location:</span>
+            <span class="s0">raise </span><span class="s1">ImproperlyConfigured(</span>
+                <span class="s4">&quot;You're using the staticfiles app &quot;</span>
+                <span class="s4">&quot;without having set the STATIC_ROOT &quot;</span>
+                <span class="s4">&quot;setting to a filesystem path.&quot;</span>
+            <span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">super().path(name)</span>
+
+
+<span class="s0">class </span><span class="s1">HashedFilesMixin:</span>
+    <span class="s1">default_template = </span><span class="s4">&quot;&quot;&quot;url(&quot;%(url)s&quot;)&quot;&quot;&quot;</span>
+    <span class="s1">max_post_process_passes = </span><span class="s5">5</span>
+    <span class="s1">support_js_module_import_aggregation = </span><span class="s0">False</span>
+    <span class="s1">_js_module_import_aggregation_patterns = (</span>
+        <span class="s4">&quot;*.js&quot;</span><span class="s0">,</span>
+        <span class="s1">(</span>
+            <span class="s1">(</span>
+                <span class="s1">(</span>
+                    <span class="s4">r&quot;&quot;&quot;(?P&lt;matched&gt;import(?s:(?P&lt;import&gt;[\s\{].*?))&quot;&quot;&quot;</span>
+                    <span class="s4">r&quot;&quot;&quot;\s*from\s*['&quot;](?P&lt;url&gt;[./].*?)[&quot;']\s*;)&quot;&quot;&quot;</span>
+                <span class="s1">)</span><span class="s0">,</span>
+                <span class="s4">&quot;&quot;&quot;import%(import)s from &quot;%(url)s&quot;;&quot;&quot;&quot;</span><span class="s0">,</span>
+            <span class="s1">)</span><span class="s0">,</span>
+            <span class="s1">(</span>
+                <span class="s1">(</span>
+                    <span class="s4">r&quot;&quot;&quot;(?P&lt;matched&gt;export(?s:(?P&lt;exports&gt;[\s\{].*?))&quot;&quot;&quot;</span>
+                    <span class="s4">r&quot;&quot;&quot;\s*from\s*[&quot;'](?P&lt;url&gt;[./].*?)[&quot;']\s*;)&quot;&quot;&quot;</span>
+                <span class="s1">)</span><span class="s0">,</span>
+                <span class="s4">&quot;&quot;&quot;export%(exports)s from &quot;%(url)s&quot;;&quot;&quot;&quot;</span><span class="s0">,</span>
+            <span class="s1">)</span><span class="s0">,</span>
+            <span class="s1">(</span>
+                <span class="s4">r&quot;&quot;&quot;(?P&lt;matched&gt;import\s*['&quot;](?P&lt;url&gt;[./].*?)[&quot;']\s*;)&quot;&quot;&quot;</span><span class="s0">,</span>
+                <span class="s4">&quot;&quot;&quot;import&quot;%(url)s&quot;;&quot;&quot;&quot;</span><span class="s0">,</span>
+            <span class="s1">)</span><span class="s0">,</span>
+            <span class="s1">(</span>
+                <span class="s4">r&quot;&quot;&quot;(?P&lt;matched&gt;import\([&quot;'](?P&lt;url&gt;.*?)[&quot;']\))&quot;&quot;&quot;</span><span class="s0">,</span>
+                <span class="s4">&quot;&quot;&quot;import(&quot;%(url)s&quot;)&quot;&quot;&quot;</span><span class="s0">,</span>
+            <span class="s1">)</span><span class="s0">,</span>
+        <span class="s1">)</span><span class="s0">,</span>
+    <span class="s1">)</span>
+    <span class="s1">patterns = (</span>
+        <span class="s1">(</span>
+            <span class="s4">&quot;*.css&quot;</span><span class="s0">,</span>
+            <span class="s1">(</span>
+                <span class="s4">r&quot;&quot;&quot;(?P&lt;matched&gt;url\(['&quot;]{0,1}\s*(?P&lt;url&gt;.*?)[&quot;']{0,1}\))&quot;&quot;&quot;</span><span class="s0">,</span>
+                <span class="s1">(</span>
+                    <span class="s4">r&quot;&quot;&quot;(?P&lt;matched&gt;@import\s*[&quot;']\s*(?P&lt;url&gt;.*?)[&quot;'])&quot;&quot;&quot;</span><span class="s0">,</span>
+                    <span class="s4">&quot;&quot;&quot;@import url(&quot;%(url)s&quot;)&quot;&quot;&quot;</span><span class="s0">,</span>
+                <span class="s1">)</span><span class="s0">,</span>
+                <span class="s1">(</span>
+                    <span class="s1">(</span>
+                        <span class="s4">r&quot;(?m)^(?P&lt;matched&gt;/\*#[ \t]&quot;</span>
+                        <span class="s4">r&quot;(?-i:sourceMappingURL)=(?P&lt;url&gt;.*)[ \t]*\*/)$&quot;</span>
+                    <span class="s1">)</span><span class="s0">,</span>
+                    <span class="s4">&quot;/*# sourceMappingURL=%(url)s */&quot;</span><span class="s0">,</span>
+                <span class="s1">)</span><span class="s0">,</span>
+            <span class="s1">)</span><span class="s0">,</span>
+        <span class="s1">)</span><span class="s0">,</span>
+        <span class="s1">(</span>
+            <span class="s4">&quot;*.js&quot;</span><span class="s0">,</span>
+            <span class="s1">(</span>
+                <span class="s1">(</span>
+                    <span class="s4">r&quot;(?m)^(?P&lt;matched&gt;//# (?-i:sourceMappingURL)=(?P&lt;url&gt;.*))$&quot;</span><span class="s0">,</span>
+                    <span class="s4">&quot;//# sourceMappingURL=%(url)s&quot;</span><span class="s0">,</span>
+                <span class="s1">)</span><span class="s0">,</span>
+            <span class="s1">)</span><span class="s0">,</span>
+        <span class="s1">)</span><span class="s0">,</span>
+    <span class="s1">)</span>
+    <span class="s1">keep_intermediate_files = </span><span class="s0">True</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">if </span><span class="s1">self.support_js_module_import_aggregation:</span>
+            <span class="s1">self.patterns += (self._js_module_import_aggregation_patterns</span><span class="s0">,</span><span class="s1">)</span>
+        <span class="s1">super().__init__(*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">self._patterns = {}</span>
+        <span class="s1">self.hashed_files = {}</span>
+        <span class="s0">for </span><span class="s1">extension</span><span class="s0">, </span><span class="s1">patterns </span><span class="s0">in </span><span class="s1">self.patterns:</span>
+            <span class="s0">for </span><span class="s1">pattern </span><span class="s0">in </span><span class="s1">patterns:</span>
+                <span class="s0">if </span><span class="s1">isinstance(pattern</span><span class="s0">, </span><span class="s1">(tuple</span><span class="s0">, </span><span class="s1">list)):</span>
+                    <span class="s1">pattern</span><span class="s0">, </span><span class="s1">template = pattern</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s1">template = self.default_template</span>
+                <span class="s1">compiled = re.compile(pattern</span><span class="s0">, </span><span class="s1">re.IGNORECASE)</span>
+                <span class="s1">self._patterns.setdefault(extension</span><span class="s0">, </span><span class="s1">[]).append((compiled</span><span class="s0">, </span><span class="s1">template))</span>
+
+    <span class="s0">def </span><span class="s1">file_hash(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">content=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Return a hash of the file with the given name and optional content. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">content </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s0">return None</span>
+        <span class="s1">hasher = md5(usedforsecurity=</span><span class="s0">False</span><span class="s1">)</span>
+        <span class="s0">for </span><span class="s1">chunk </span><span class="s0">in </span><span class="s1">content.chunks():</span>
+            <span class="s1">hasher.update(chunk)</span>
+        <span class="s0">return </span><span class="s1">hasher.hexdigest()[:</span><span class="s5">12</span><span class="s1">]</span>
+
+    <span class="s0">def </span><span class="s1">hashed_name(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">content=</span><span class="s0">None, </span><span class="s1">filename=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s3"># `filename` is the name of file to hash if `content` isn't given.</span>
+        <span class="s3"># `name` is the base name to construct the new hashed filename from.</span>
+        <span class="s1">parsed_name = urlsplit(unquote(name))</span>
+        <span class="s1">clean_name = parsed_name.path.strip()</span>
+        <span class="s1">filename = (filename </span><span class="s0">and </span><span class="s1">urlsplit(unquote(filename)).path.strip()) </span><span class="s0">or </span><span class="s1">clean_name</span>
+        <span class="s1">opened = content </span><span class="s0">is None</span>
+        <span class="s0">if </span><span class="s1">opened:</span>
+            <span class="s0">if not </span><span class="s1">self.exists(filename):</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span>
+                    <span class="s4">&quot;The file '%s' could not be found with %r.&quot; </span><span class="s1">% (filename</span><span class="s0">, </span><span class="s1">self)</span>
+                <span class="s1">)</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">content = self.open(filename)</span>
+            <span class="s0">except </span><span class="s1">OSError:</span>
+                <span class="s3"># Handle directory paths and fragments</span>
+                <span class="s0">return </span><span class="s1">name</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">file_hash = self.file_hash(clean_name</span><span class="s0">, </span><span class="s1">content)</span>
+        <span class="s0">finally</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">opened:</span>
+                <span class="s1">content.close()</span>
+        <span class="s1">path</span><span class="s0">, </span><span class="s1">filename = os.path.split(clean_name)</span>
+        <span class="s1">root</span><span class="s0">, </span><span class="s1">ext = os.path.splitext(filename)</span>
+        <span class="s1">file_hash = (</span><span class="s4">&quot;.%s&quot; </span><span class="s1">% file_hash) </span><span class="s0">if </span><span class="s1">file_hash </span><span class="s0">else </span><span class="s4">&quot;&quot;</span>
+        <span class="s1">hashed_name = os.path.join(path</span><span class="s0">, </span><span class="s4">&quot;%s%s%s&quot; </span><span class="s1">% (root</span><span class="s0">, </span><span class="s1">file_hash</span><span class="s0">, </span><span class="s1">ext))</span>
+        <span class="s1">unparsed_name = list(parsed_name)</span>
+        <span class="s1">unparsed_name[</span><span class="s5">2</span><span class="s1">] = hashed_name</span>
+        <span class="s3"># Special casing for a @font-face hack, like url(myfont.eot?#iefix&quot;)</span>
+        <span class="s3"># http://www.fontspring.com/blog/the-new-bulletproof-font-face-syntax</span>
+        <span class="s0">if </span><span class="s4">&quot;?#&quot; </span><span class="s0">in </span><span class="s1">name </span><span class="s0">and not </span><span class="s1">unparsed_name[</span><span class="s5">3</span><span class="s1">]:</span>
+            <span class="s1">unparsed_name[</span><span class="s5">2</span><span class="s1">] += </span><span class="s4">&quot;?&quot;</span>
+        <span class="s0">return </span><span class="s1">urlunsplit(unparsed_name)</span>
+
+    <span class="s0">def </span><span class="s1">_url(self</span><span class="s0">, </span><span class="s1">hashed_name_func</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">force=</span><span class="s0">False, </span><span class="s1">hashed_files=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Return the non-hashed URL in DEBUG mode. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">settings.DEBUG </span><span class="s0">and not </span><span class="s1">force:</span>
+            <span class="s1">hashed_name</span><span class="s0">, </span><span class="s1">fragment = name</span><span class="s0">, </span><span class="s4">&quot;&quot;</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">clean_name</span><span class="s0">, </span><span class="s1">fragment = urldefrag(name)</span>
+            <span class="s0">if </span><span class="s1">urlsplit(clean_name).path.endswith(</span><span class="s4">&quot;/&quot;</span><span class="s1">):  </span><span class="s3"># don't hash paths</span>
+                <span class="s1">hashed_name = name</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">args = (clean_name</span><span class="s0">,</span><span class="s1">)</span>
+                <span class="s0">if </span><span class="s1">hashed_files </span><span class="s0">is not None</span><span class="s1">:</span>
+                    <span class="s1">args += (hashed_files</span><span class="s0">,</span><span class="s1">)</span>
+                <span class="s1">hashed_name = hashed_name_func(*args)</span>
+
+        <span class="s1">final_url = super().url(hashed_name)</span>
+
+        <span class="s3"># Special casing for a @font-face hack, like url(myfont.eot?#iefix&quot;)</span>
+        <span class="s3"># http://www.fontspring.com/blog/the-new-bulletproof-font-face-syntax</span>
+        <span class="s1">query_fragment = </span><span class="s4">&quot;?#&quot; </span><span class="s0">in </span><span class="s1">name  </span><span class="s3"># [sic!]</span>
+        <span class="s0">if </span><span class="s1">fragment </span><span class="s0">or </span><span class="s1">query_fragment:</span>
+            <span class="s1">urlparts = list(urlsplit(final_url))</span>
+            <span class="s0">if </span><span class="s1">fragment </span><span class="s0">and not </span><span class="s1">urlparts[</span><span class="s5">4</span><span class="s1">]:</span>
+                <span class="s1">urlparts[</span><span class="s5">4</span><span class="s1">] = fragment</span>
+            <span class="s0">if </span><span class="s1">query_fragment </span><span class="s0">and not </span><span class="s1">urlparts[</span><span class="s5">3</span><span class="s1">]:</span>
+                <span class="s1">urlparts[</span><span class="s5">2</span><span class="s1">] += </span><span class="s4">&quot;?&quot;</span>
+            <span class="s1">final_url = urlunsplit(urlparts)</span>
+
+        <span class="s0">return </span><span class="s1">unquote(final_url)</span>
+
+    <span class="s0">def </span><span class="s1">url(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">force=</span><span class="s0">False</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Return the non-hashed URL in DEBUG mode. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self._url(self.stored_name</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">force)</span>
+
+    <span class="s0">def </span><span class="s1">url_converter(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">hashed_files</span><span class="s0">, </span><span class="s1">template=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Return the custom URL converter for the given file name. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">template </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">template = self.default_template</span>
+
+        <span class="s0">def </span><span class="s1">converter(matchobj):</span>
+            <span class="s2">&quot;&quot;&quot; 
+            Convert the matched URL to a normalized and hashed URL. 
+ 
+            This requires figuring out which files the matched URL resolves 
+            to and calling the url() method of the storage. 
+            &quot;&quot;&quot;</span>
+            <span class="s1">matches = matchobj.groupdict()</span>
+            <span class="s1">matched = matches[</span><span class="s4">&quot;matched&quot;</span><span class="s1">]</span>
+            <span class="s1">url = matches[</span><span class="s4">&quot;url&quot;</span><span class="s1">]</span>
+
+            <span class="s3"># Ignore absolute/protocol-relative and data-uri URLs.</span>
+            <span class="s0">if </span><span class="s1">re.match(</span><span class="s4">r&quot;^[a-z]+:&quot;</span><span class="s0">, </span><span class="s1">url) </span><span class="s0">or </span><span class="s1">url.startswith(</span><span class="s4">&quot;//&quot;</span><span class="s1">):</span>
+                <span class="s0">return </span><span class="s1">matched</span>
+
+            <span class="s3"># Ignore absolute URLs that don't point to a static file (dynamic</span>
+            <span class="s3"># CSS / JS?). Note that STATIC_URL cannot be empty.</span>
+            <span class="s0">if </span><span class="s1">url.startswith(</span><span class="s4">&quot;/&quot;</span><span class="s1">) </span><span class="s0">and not </span><span class="s1">url.startswith(settings.STATIC_URL):</span>
+                <span class="s0">return </span><span class="s1">matched</span>
+
+            <span class="s3"># Strip off the fragment so a path-like fragment won't interfere.</span>
+            <span class="s1">url_path</span><span class="s0">, </span><span class="s1">fragment = urldefrag(url)</span>
+
+            <span class="s3"># Ignore URLs without a path</span>
+            <span class="s0">if not </span><span class="s1">url_path:</span>
+                <span class="s0">return </span><span class="s1">matched</span>
+
+            <span class="s0">if </span><span class="s1">url_path.startswith(</span><span class="s4">&quot;/&quot;</span><span class="s1">):</span>
+                <span class="s3"># Otherwise the condition above would have returned prematurely.</span>
+                <span class="s0">assert </span><span class="s1">url_path.startswith(settings.STATIC_URL)</span>
+                <span class="s1">target_name = url_path.removeprefix(settings.STATIC_URL)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s3"># We're using the posixpath module to mix paths and URLs conveniently.</span>
+                <span class="s1">source_name = name </span><span class="s0">if </span><span class="s1">os.sep == </span><span class="s4">&quot;/&quot; </span><span class="s0">else </span><span class="s1">name.replace(os.sep</span><span class="s0">, </span><span class="s4">&quot;/&quot;</span><span class="s1">)</span>
+                <span class="s1">target_name = posixpath.join(posixpath.dirname(source_name)</span><span class="s0">, </span><span class="s1">url_path)</span>
+
+            <span class="s3"># Determine the hashed name of the target file with the storage backend.</span>
+            <span class="s1">hashed_url = self._url(</span>
+                <span class="s1">self._stored_name</span><span class="s0">,</span>
+                <span class="s1">unquote(target_name)</span><span class="s0">,</span>
+                <span class="s1">force=</span><span class="s0">True,</span>
+                <span class="s1">hashed_files=hashed_files</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+            <span class="s1">transformed_url = </span><span class="s4">&quot;/&quot;</span><span class="s1">.join(</span>
+                <span class="s1">url_path.split(</span><span class="s4">&quot;/&quot;</span><span class="s1">)[:-</span><span class="s5">1</span><span class="s1">] + hashed_url.split(</span><span class="s4">&quot;/&quot;</span><span class="s1">)[-</span><span class="s5">1</span><span class="s1">:]</span>
+            <span class="s1">)</span>
+
+            <span class="s3"># Restore the fragment that was stripped off earlier.</span>
+            <span class="s0">if </span><span class="s1">fragment:</span>
+                <span class="s1">transformed_url += (</span><span class="s4">&quot;?#&quot; </span><span class="s0">if </span><span class="s4">&quot;?#&quot; </span><span class="s0">in </span><span class="s1">url </span><span class="s0">else </span><span class="s4">&quot;#&quot;</span><span class="s1">) + fragment</span>
+
+            <span class="s3"># Return the hashed version to the file</span>
+            <span class="s1">matches[</span><span class="s4">&quot;url&quot;</span><span class="s1">] = unquote(transformed_url)</span>
+            <span class="s0">return </span><span class="s1">template % matches</span>
+
+        <span class="s0">return </span><span class="s1">converter</span>
+
+    <span class="s0">def </span><span class="s1">post_process(self</span><span class="s0">, </span><span class="s1">paths</span><span class="s0">, </span><span class="s1">dry_run=</span><span class="s0">False, </span><span class="s1">**options):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Post process the given dictionary of files (called from collectstatic). 
+ 
+        Processing is actually two separate operations: 
+ 
+        1. renaming files to include a hash of their content for cache-busting, 
+           and copying those files to the target storage. 
+        2. adjusting files which contain references to other files so they 
+           refer to the cache-busting filenames. 
+ 
+        If either of these are performed on a file, then that file is considered 
+        post-processed. 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># don't even dare to process the files if we're in dry run mode</span>
+        <span class="s0">if </span><span class="s1">dry_run:</span>
+            <span class="s0">return</span>
+
+        <span class="s3"># where to store the new paths</span>
+        <span class="s1">hashed_files = {}</span>
+
+        <span class="s3"># build a list of adjustable files</span>
+        <span class="s1">adjustable_paths = [</span>
+            <span class="s1">path </span><span class="s0">for </span><span class="s1">path </span><span class="s0">in </span><span class="s1">paths </span><span class="s0">if </span><span class="s1">matches_patterns(path</span><span class="s0">, </span><span class="s1">self._patterns)</span>
+        <span class="s1">]</span>
+
+        <span class="s3"># Adjustable files to yield at end, keyed by the original path.</span>
+        <span class="s1">processed_adjustable_paths = {}</span>
+
+        <span class="s3"># Do a single pass first. Post-process all files once, yielding not</span>
+        <span class="s3"># adjustable files and exceptions, and collecting adjustable files.</span>
+        <span class="s0">for </span><span class="s1">name</span><span class="s0">, </span><span class="s1">hashed_name</span><span class="s0">, </span><span class="s1">processed</span><span class="s0">, </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">self._post_process(</span>
+            <span class="s1">paths</span><span class="s0">, </span><span class="s1">adjustable_paths</span><span class="s0">, </span><span class="s1">hashed_files</span>
+        <span class="s1">):</span>
+            <span class="s0">if </span><span class="s1">name </span><span class="s0">not in </span><span class="s1">adjustable_paths </span><span class="s0">or </span><span class="s1">isinstance(processed</span><span class="s0">, </span><span class="s1">Exception):</span>
+                <span class="s0">yield </span><span class="s1">name</span><span class="s0">, </span><span class="s1">hashed_name</span><span class="s0">, </span><span class="s1">processed</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">processed_adjustable_paths[name] = (name</span><span class="s0">, </span><span class="s1">hashed_name</span><span class="s0">, </span><span class="s1">processed)</span>
+
+        <span class="s1">paths = {path: paths[path] </span><span class="s0">for </span><span class="s1">path </span><span class="s0">in </span><span class="s1">adjustable_paths}</span>
+        <span class="s1">substitutions = </span><span class="s0">False</span>
+
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(self.max_post_process_passes):</span>
+            <span class="s1">substitutions = </span><span class="s0">False</span>
+            <span class="s0">for </span><span class="s1">name</span><span class="s0">, </span><span class="s1">hashed_name</span><span class="s0">, </span><span class="s1">processed</span><span class="s0">, </span><span class="s1">subst </span><span class="s0">in </span><span class="s1">self._post_process(</span>
+                <span class="s1">paths</span><span class="s0">, </span><span class="s1">adjustable_paths</span><span class="s0">, </span><span class="s1">hashed_files</span>
+            <span class="s1">):</span>
+                <span class="s3"># Overwrite since hashed_name may be newer.</span>
+                <span class="s1">processed_adjustable_paths[name] = (name</span><span class="s0">, </span><span class="s1">hashed_name</span><span class="s0">, </span><span class="s1">processed)</span>
+                <span class="s1">substitutions = substitutions </span><span class="s0">or </span><span class="s1">subst</span>
+
+            <span class="s0">if not </span><span class="s1">substitutions:</span>
+                <span class="s0">break</span>
+
+        <span class="s0">if </span><span class="s1">substitutions:</span>
+            <span class="s0">yield </span><span class="s4">&quot;All&quot;</span><span class="s0">, None, </span><span class="s1">RuntimeError(</span><span class="s4">&quot;Max post-process passes exceeded.&quot;</span><span class="s1">)</span>
+
+        <span class="s3"># Store the processed paths</span>
+        <span class="s1">self.hashed_files.update(hashed_files)</span>
+
+        <span class="s3"># Yield adjustable files with final, hashed name.</span>
+        <span class="s0">yield from </span><span class="s1">processed_adjustable_paths.values()</span>
+
+    <span class="s0">def </span><span class="s1">_post_process(self</span><span class="s0">, </span><span class="s1">paths</span><span class="s0">, </span><span class="s1">adjustable_paths</span><span class="s0">, </span><span class="s1">hashed_files):</span>
+        <span class="s3"># Sort the files by directory level</span>
+        <span class="s0">def </span><span class="s1">path_level(name):</span>
+            <span class="s0">return </span><span class="s1">len(name.split(os.sep))</span>
+
+        <span class="s0">for </span><span class="s1">name </span><span class="s0">in </span><span class="s1">sorted(paths</span><span class="s0">, </span><span class="s1">key=path_level</span><span class="s0">, </span><span class="s1">reverse=</span><span class="s0">True</span><span class="s1">):</span>
+            <span class="s1">substitutions = </span><span class="s0">True</span>
+            <span class="s3"># use the original, local file, not the copied-but-unprocessed</span>
+            <span class="s3"># file, which might be somewhere far away, like S3</span>
+            <span class="s1">storage</span><span class="s0">, </span><span class="s1">path = paths[name]</span>
+            <span class="s0">with </span><span class="s1">storage.open(path) </span><span class="s0">as </span><span class="s1">original_file:</span>
+                <span class="s1">cleaned_name = self.clean_name(name)</span>
+                <span class="s1">hash_key = self.hash_key(cleaned_name)</span>
+
+                <span class="s3"># generate the hash with the original content, even for</span>
+                <span class="s3"># adjustable files.</span>
+                <span class="s0">if </span><span class="s1">hash_key </span><span class="s0">not in </span><span class="s1">hashed_files:</span>
+                    <span class="s1">hashed_name = self.hashed_name(name</span><span class="s0">, </span><span class="s1">original_file)</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s1">hashed_name = hashed_files[hash_key]</span>
+
+                <span class="s3"># then get the original's file content..</span>
+                <span class="s0">if </span><span class="s1">hasattr(original_file</span><span class="s0">, </span><span class="s4">&quot;seek&quot;</span><span class="s1">):</span>
+                    <span class="s1">original_file.seek(</span><span class="s5">0</span><span class="s1">)</span>
+
+                <span class="s1">hashed_file_exists = self.exists(hashed_name)</span>
+                <span class="s1">processed = </span><span class="s0">False</span>
+
+                <span class="s3"># ..to apply each replacement pattern to the content</span>
+                <span class="s0">if </span><span class="s1">name </span><span class="s0">in </span><span class="s1">adjustable_paths:</span>
+                    <span class="s1">old_hashed_name = hashed_name</span>
+                    <span class="s0">try</span><span class="s1">:</span>
+                        <span class="s1">content = original_file.read().decode(</span><span class="s4">&quot;utf-8&quot;</span><span class="s1">)</span>
+                    <span class="s0">except </span><span class="s1">UnicodeDecodeError </span><span class="s0">as </span><span class="s1">exc:</span>
+                        <span class="s0">yield </span><span class="s1">name</span><span class="s0">, None, </span><span class="s1">exc</span><span class="s0">, False</span>
+                    <span class="s0">for </span><span class="s1">extension</span><span class="s0">, </span><span class="s1">patterns </span><span class="s0">in </span><span class="s1">self._patterns.items():</span>
+                        <span class="s0">if </span><span class="s1">matches_patterns(path</span><span class="s0">, </span><span class="s1">(extension</span><span class="s0">,</span><span class="s1">)):</span>
+                            <span class="s0">for </span><span class="s1">pattern</span><span class="s0">, </span><span class="s1">template </span><span class="s0">in </span><span class="s1">patterns:</span>
+                                <span class="s1">converter = self.url_converter(</span>
+                                    <span class="s1">name</span><span class="s0">, </span><span class="s1">hashed_files</span><span class="s0">, </span><span class="s1">template</span>
+                                <span class="s1">)</span>
+                                <span class="s0">try</span><span class="s1">:</span>
+                                    <span class="s1">content = pattern.sub(converter</span><span class="s0">, </span><span class="s1">content)</span>
+                                <span class="s0">except </span><span class="s1">ValueError </span><span class="s0">as </span><span class="s1">exc:</span>
+                                    <span class="s0">yield </span><span class="s1">name</span><span class="s0">, None, </span><span class="s1">exc</span><span class="s0">, False</span>
+                    <span class="s0">if </span><span class="s1">hashed_file_exists:</span>
+                        <span class="s1">self.delete(hashed_name)</span>
+                    <span class="s3"># then save the processed result</span>
+                    <span class="s1">content_file = ContentFile(content.encode())</span>
+                    <span class="s0">if </span><span class="s1">self.keep_intermediate_files:</span>
+                        <span class="s3"># Save intermediate file for reference</span>
+                        <span class="s1">self._save(hashed_name</span><span class="s0">, </span><span class="s1">content_file)</span>
+                    <span class="s1">hashed_name = self.hashed_name(name</span><span class="s0">, </span><span class="s1">content_file)</span>
+
+                    <span class="s0">if </span><span class="s1">self.exists(hashed_name):</span>
+                        <span class="s1">self.delete(hashed_name)</span>
+
+                    <span class="s1">saved_name = self._save(hashed_name</span><span class="s0">, </span><span class="s1">content_file)</span>
+                    <span class="s1">hashed_name = self.clean_name(saved_name)</span>
+                    <span class="s3"># If the file hash stayed the same, this file didn't change</span>
+                    <span class="s0">if </span><span class="s1">old_hashed_name == hashed_name:</span>
+                        <span class="s1">substitutions = </span><span class="s0">False</span>
+                    <span class="s1">processed = </span><span class="s0">True</span>
+
+                <span class="s0">if not </span><span class="s1">processed:</span>
+                    <span class="s3"># or handle the case in which neither processing nor</span>
+                    <span class="s3"># a change to the original file happened</span>
+                    <span class="s0">if not </span><span class="s1">hashed_file_exists:</span>
+                        <span class="s1">processed = </span><span class="s0">True</span>
+                        <span class="s1">saved_name = self._save(hashed_name</span><span class="s0">, </span><span class="s1">original_file)</span>
+                        <span class="s1">hashed_name = self.clean_name(saved_name)</span>
+
+                <span class="s3"># and then set the cache accordingly</span>
+                <span class="s1">hashed_files[hash_key] = hashed_name</span>
+
+                <span class="s0">yield </span><span class="s1">name</span><span class="s0">, </span><span class="s1">hashed_name</span><span class="s0">, </span><span class="s1">processed</span><span class="s0">, </span><span class="s1">substitutions</span>
+
+    <span class="s0">def </span><span class="s1">clean_name(self</span><span class="s0">, </span><span class="s1">name):</span>
+        <span class="s0">return </span><span class="s1">name.replace(</span><span class="s4">&quot;</span><span class="s0">\\</span><span class="s4">&quot;</span><span class="s0">, </span><span class="s4">&quot;/&quot;</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">hash_key(self</span><span class="s0">, </span><span class="s1">name):</span>
+        <span class="s0">return </span><span class="s1">name</span>
+
+    <span class="s0">def </span><span class="s1">_stored_name(self</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">hashed_files):</span>
+        <span class="s3"># Normalize the path to avoid multiple names for the same file like</span>
+        <span class="s3"># ../foo/bar.css and ../foo/../foo/bar.css which normalize to the same</span>
+        <span class="s3"># path.</span>
+        <span class="s1">name = posixpath.normpath(name)</span>
+        <span class="s1">cleaned_name = self.clean_name(name)</span>
+        <span class="s1">hash_key = self.hash_key(cleaned_name)</span>
+        <span class="s1">cache_name = hashed_files.get(hash_key)</span>
+        <span class="s0">if </span><span class="s1">cache_name </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">cache_name = self.clean_name(self.hashed_name(name))</span>
+        <span class="s0">return </span><span class="s1">cache_name</span>
+
+    <span class="s0">def </span><span class="s1">stored_name(self</span><span class="s0">, </span><span class="s1">name):</span>
+        <span class="s1">cleaned_name = self.clean_name(name)</span>
+        <span class="s1">hash_key = self.hash_key(cleaned_name)</span>
+        <span class="s1">cache_name = self.hashed_files.get(hash_key)</span>
+        <span class="s0">if </span><span class="s1">cache_name:</span>
+            <span class="s0">return </span><span class="s1">cache_name</span>
+        <span class="s3"># No cached name found, recalculate it from the files.</span>
+        <span class="s1">intermediate_name = name</span>
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(self.max_post_process_passes + </span><span class="s5">1</span><span class="s1">):</span>
+            <span class="s1">cache_name = self.clean_name(</span>
+                <span class="s1">self.hashed_name(name</span><span class="s0">, </span><span class="s1">content=</span><span class="s0">None, </span><span class="s1">filename=intermediate_name)</span>
+            <span class="s1">)</span>
+            <span class="s0">if </span><span class="s1">intermediate_name == cache_name:</span>
+                <span class="s3"># Store the hashed name if there was a miss.</span>
+                <span class="s1">self.hashed_files[hash_key] = cache_name</span>
+                <span class="s0">return </span><span class="s1">cache_name</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s3"># Move on to the next intermediate file.</span>
+                <span class="s1">intermediate_name = cache_name</span>
+        <span class="s3"># If the cache name can't be determined after the max number of passes,</span>
+        <span class="s3"># the intermediate files on disk may be corrupt; avoid an infinite loop.</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;The name '%s' could not be hashed with %r.&quot; </span><span class="s1">% (name</span><span class="s0">, </span><span class="s1">self))</span>
+
+
+<span class="s0">class </span><span class="s1">ManifestFilesMixin(HashedFilesMixin):</span>
+    <span class="s1">manifest_version = </span><span class="s4">&quot;1.1&quot;  </span><span class="s3"># the manifest format standard</span>
+    <span class="s1">manifest_name = </span><span class="s4">&quot;staticfiles.json&quot;</span>
+    <span class="s1">manifest_strict = </span><span class="s0">True</span>
+    <span class="s1">keep_intermediate_files = </span><span class="s0">False</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">manifest_storage=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super().__init__(*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+        <span class="s0">if </span><span class="s1">manifest_storage </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">manifest_storage = self</span>
+        <span class="s1">self.manifest_storage = manifest_storage</span>
+        <span class="s1">self.hashed_files</span><span class="s0">, </span><span class="s1">self.manifest_hash = self.load_manifest()</span>
+
+    <span class="s0">def </span><span class="s1">read_manifest(self):</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s0">with </span><span class="s1">self.manifest_storage.open(self.manifest_name) </span><span class="s0">as </span><span class="s1">manifest:</span>
+                <span class="s0">return </span><span class="s1">manifest.read().decode()</span>
+        <span class="s0">except </span><span class="s1">FileNotFoundError:</span>
+            <span class="s0">return None</span>
+
+    <span class="s0">def </span><span class="s1">load_manifest(self):</span>
+        <span class="s1">content = self.read_manifest()</span>
+        <span class="s0">if </span><span class="s1">content </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">{}</span><span class="s0">, </span><span class="s4">&quot;&quot;</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">stored = json.loads(content)</span>
+        <span class="s0">except </span><span class="s1">json.JSONDecodeError:</span>
+            <span class="s0">pass</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">version = stored.get(</span><span class="s4">&quot;version&quot;</span><span class="s1">)</span>
+            <span class="s0">if </span><span class="s1">version </span><span class="s0">in </span><span class="s1">(</span><span class="s4">&quot;1.0&quot;</span><span class="s0">, </span><span class="s4">&quot;1.1&quot;</span><span class="s1">):</span>
+                <span class="s0">return </span><span class="s1">stored.get(</span><span class="s4">&quot;paths&quot;</span><span class="s0">, </span><span class="s1">{})</span><span class="s0">, </span><span class="s1">stored.get(</span><span class="s4">&quot;hash&quot;</span><span class="s0">, </span><span class="s4">&quot;&quot;</span><span class="s1">)</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span>
+            <span class="s4">&quot;Couldn't load manifest '%s' (version %s)&quot;</span>
+            <span class="s1">% (self.manifest_name</span><span class="s0">, </span><span class="s1">self.manifest_version)</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">post_process(self</span><span class="s0">, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self.hashed_files = {}</span>
+        <span class="s0">yield from </span><span class="s1">super().post_process(*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+        <span class="s0">if not </span><span class="s1">kwargs.get(</span><span class="s4">&quot;dry_run&quot;</span><span class="s1">):</span>
+            <span class="s1">self.save_manifest()</span>
+
+    <span class="s0">def </span><span class="s1">save_manifest(self):</span>
+        <span class="s1">self.manifest_hash = self.file_hash(</span>
+            <span class="s0">None, </span><span class="s1">ContentFile(json.dumps(sorted(self.hashed_files.items())).encode())</span>
+        <span class="s1">)</span>
+        <span class="s1">payload = {</span>
+            <span class="s4">&quot;paths&quot;</span><span class="s1">: self.hashed_files</span><span class="s0">,</span>
+            <span class="s4">&quot;version&quot;</span><span class="s1">: self.manifest_version</span><span class="s0">,</span>
+            <span class="s4">&quot;hash&quot;</span><span class="s1">: self.manifest_hash</span><span class="s0">,</span>
+        <span class="s1">}</span>
+        <span class="s0">if </span><span class="s1">self.manifest_storage.exists(self.manifest_name):</span>
+            <span class="s1">self.manifest_storage.delete(self.manifest_name)</span>
+        <span class="s1">contents = json.dumps(payload).encode()</span>
+        <span class="s1">self.manifest_storage._save(self.manifest_name</span><span class="s0">, </span><span class="s1">ContentFile(contents))</span>
+
+    <span class="s0">def </span><span class="s1">stored_name(self</span><span class="s0">, </span><span class="s1">name):</span>
+        <span class="s1">parsed_name = urlsplit(unquote(name))</span>
+        <span class="s1">clean_name = parsed_name.path.strip()</span>
+        <span class="s1">hash_key = self.hash_key(clean_name)</span>
+        <span class="s1">cache_name = self.hashed_files.get(hash_key)</span>
+        <span class="s0">if </span><span class="s1">cache_name </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">self.manifest_strict:</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span>
+                    <span class="s4">&quot;Missing staticfiles manifest entry for '%s'&quot; </span><span class="s1">% clean_name</span>
+                <span class="s1">)</span>
+            <span class="s1">cache_name = self.clean_name(self.hashed_name(name))</span>
+        <span class="s1">unparsed_name = list(parsed_name)</span>
+        <span class="s1">unparsed_name[</span><span class="s5">2</span><span class="s1">] = cache_name</span>
+        <span class="s3"># Special casing for a @font-face hack, like url(myfont.eot?#iefix&quot;)</span>
+        <span class="s3"># http://www.fontspring.com/blog/the-new-bulletproof-font-face-syntax</span>
+        <span class="s0">if </span><span class="s4">&quot;?#&quot; </span><span class="s0">in </span><span class="s1">name </span><span class="s0">and not </span><span class="s1">unparsed_name[</span><span class="s5">3</span><span class="s1">]:</span>
+            <span class="s1">unparsed_name[</span><span class="s5">2</span><span class="s1">] += </span><span class="s4">&quot;?&quot;</span>
+        <span class="s0">return </span><span class="s1">urlunsplit(unparsed_name)</span>
+
+
+<span class="s0">class </span><span class="s1">ManifestStaticFilesStorage(ManifestFilesMixin</span><span class="s0">, </span><span class="s1">StaticFilesStorage):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    A static file system storage backend which also saves 
+    hashed copies of the files it saves. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">pass</span>
+
+
+<span class="s0">class </span><span class="s1">ConfiguredStorage(LazyObject):</span>
+    <span class="s0">def </span><span class="s1">_setup(self):</span>
+        <span class="s1">self._wrapped = storages[STATICFILES_STORAGE_ALIAS]</span>
+
+
+<span class="s1">staticfiles_storage = ConfiguredStorage()</span>
+</pre>
+</body>
+</html>
